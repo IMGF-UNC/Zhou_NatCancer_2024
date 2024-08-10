@@ -1,0 +1,1079 @@
+---
+title: "Xin Zhou - Dotti - Mouse 10X Analysis 2024 Nature Cancer Code"
+geometry: margin=0.5in
+output:
+  html_document: 
+    toc: true
+    toc_float: 
+      collapsed: false
+      smooth_scroll: false
+    number_sections: true
+    df_print: paged
+  pdf_document: default
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(results = 'hold',
+                      fig.show = 'hold',
+                      out.width='100%',
+                      warning = FALSE,
+                      error = FALSE,
+                      message = FALSE,
+                      cache = TRUE,
+                      echo = FALSE)
+```
+
+# Imports
+```{r Imports, include=TRUE, eval=TRUE}
+library(Seurat)
+library(dplyr)
+library(parallel)
+library(future)
+library(ggplot2)
+library(RColorBrewer)
+library(SingleR)
+library(celldex)
+library(SingleCellExperiment)
+library(rlang)
+library(ggplot2)
+library(rmarkdown)
+library(DoubletFinder)
+library(Orthology.eg.db)
+library(org.Hs.eg.db)
+library(hgu95av2.db)
+library(biomaRt)
+library(stringr)
+library(svglite)
+library(rasterpdf)
+library(scales)
+```
+
+```{r set_variables}
+humanMart = useMart("ensembl", dataset = "hsapiens_gene_ensembl", host="https://dec2021.archive.ensembl.org/")
+mouseMart = useMart("ensembl", dataset = "mmusculus_gene_ensembl", host="https://dec2021.archive.ensembl.org/")
+#
+# Configuration variables
+#
+set.seed(779218866)
+run.status <- 'partial' 
+run.print.progress <- FALSE
+run.start_time <- Sys.time()
+```
+
+
+# - Loading of Data
+```{r Sample Loading, include=TRUE, eval=TRUE}
+
+sample.list=c("19T", "CD19_NKT", "NT_NKT", "NT_T") #hard coding names of all data samples
+
+workdir = '__________________' #location of samples
+outs=""
+samples <- list()
+
+#The below takes each sample and creates a SeuratObject for them.
+for( sample in sample.list ) {
+  dat <- Read10X(data.dir = paste0(workdir,'/' ,sample,outs))
+  samples[[sample]] <- CreateSeuratObject(counts = dat, min.cells = 3, min.features = 150, project = sample)
+  samples[[sample]] <- RenameCells(samples[[sample]], add.cell.id = sample) # Prefix cell names with sample 
+  
+  # WILL ALSO CAPITALIZE MOUSE GENES
+  samples[[sample]]@assays[["RNA"]]@data@Dimnames[[1]] <- toupper(samples[[sample]]@assays[["RNA"]]@data@Dimnames[[1]])
+  samples[[sample]]@assays[["RNA"]]@counts@Dimnames[[1]] <- toupper(samples[[sample]]@assays[["RNA"]]@counts@Dimnames[[1]])
+  rm(dat)
+}
+```
+
+# - QC {.tabset}
+```{r QC, include=TRUE, eval=TRUE, results='asis', fig.show='asis'}
+for( sample in names(samples) ) {
+    samples[[sample]][['p.mito']] <- PercentageFeatureSet(samples[[sample]], pattern = '^MT-')
+    samples[[sample]][['p.ribo']] <- PercentageFeatureSet(samples[[sample]], pattern = '^RP[SL]')
+}
+for(sample in names(samples)){
+  
+  a <- VlnPlot(object = samples[[sample]], features = c('nFeature_RNA', 'nCount_RNA', 'p.mito', 'p.ribo'), log = TRUE, pt.size = 0.1, ncol = 4)
+  b <- FeatureScatter(samples[[sample]], feature1 = 'nCount_RNA', feature2 = 'p.mito') + NoLegend()
+  c <- FeatureScatter(samples[[sample]], feature1 = 'nCount_RNA', feature2 = 'nFeature_RNA') + NoLegend()
+  cat('##', sample,"\n\n")
+  print(a)
+  print( CombinePlots(plots = list(b, c)) + labs(title = sample))
+  
+  cat("\n\n")
+  rm(a,b,c)
+}
+```
+
+# - Labelling of data
+
+## - Generating Graphs {.tabset}
+
+```{r QA:feature_counts, fig.height = 8, fig.width = 12, include=TRUE, eval=TRUE, results='asis', fig.show='asis'}
+for( sample in names(samples) ) {
+  
+  tmp.dat <- data.frame(
+    count = samples[[sample]]@meta.data$nCount_RNA,
+    feature = samples[[sample]]@meta.data$nFeature_RNA,
+    ratio = samples[[sample]]@meta.data$nCount_RNA / samples[[sample]]@meta.data$nFeature_RNA,
+    p.mito = samples[[sample]]@meta.data$p.mito,
+    p.ribo = samples[[sample]]@meta.data$p.ribo
+  )
+  #BENCHMARKS
+  b_hratio <- 5
+  high_ratio <- quantile(tmp.dat$ratio, probs = .9) # tell me the cutoff for the top 10% of ratios
+  b_hratio <- high_ratio
+  
+  b_hmito <- 20
+  high_mito <- quantile(tmp.dat$p.mito, probs=c(.9)) # tell me the cutoff for the top 10% of mitochondrial activity
+  b_hmito <- high_mito
+  
+  b_hribo <- 25
+  high_ribo <- quantile(tmp.dat$p.ribo, probs=c(.9)) # tell me the cutoff for the top 10% of ribosomal activity
+  b_hribo <- high_ribo
+  
+  b_lfeature <- 300
+  low_feature <- quantile(tmp.dat$feature, prob=c(.1)) # tell me the cutoff for the lower 10% of features
+  b_lfeature <- low_feature
+    
+  b_lcount <- 1000
+  low_count <- quantile(tmp.dat$count, prob=c(.1)) # tell me the cutoff for the lower 10% of counts
+  b_lcount <- low_count
+  
+  # Set up cell descriptions:
+  tmp.dat$desc <- ''
+  tmp.dat[tmp.dat$ratio > b_hratio,]$desc     <- 'HRatio'                                                # High Ratio of counts to features
+  tmp.dat[tmp.dat$p.mito > b_hmito, ]$desc  <- paste0(tmp.dat[tmp.dat$p.mito > b_hmito, ]$desc, 'HMito')    # High Mitochondrial
+  tmp.dat[tmp.dat$p.ribo > b_hribo, ]$desc  <- paste0(tmp.dat[tmp.dat$p.ribo > b_hribo, ]$desc, 'HRibo')    # High Ribosomal Activity
+  tmp.dat[tmp.dat$feature < b_lfeature,]$desc <- 'LFeature'                                              # Low Feature Count
+  tmp.dat[tmp.dat$count < b_lcount,]$desc  <- 'LCount'                                                # Low Count
+  tmp.dat[tmp.dat$desc == '', ]$desc   <- 'Default'                                               # none of the Above
+  tmp.dat$desc <- factor(tmp.dat$desc)
+  
+  # Stash the descriptions assembled above
+  samples[[sample]][['description']] <- tmp.dat$desc
+  
+  # Sort our dataframe by GEM feature count
+  tmp.dat <- tmp.dat[order(tmp.dat$feature),]
+  tmp.dat$row <- 1:nrow(tmp.dat)
+
+  
+    theme <- theme(axis.title.x=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = 'none')
+  scale_color <- scale_color_brewer(palette = 'Spectral') #using ggplot palletes
+  scale_color <- scale_color_manual(breaks = c('Default', 'LCount', 'LFeature', 'HMito', 'HMitoHRibo', 'HRatio', 'HRatioHMito', 'HRatioHMitoHRibo', 'HRatioHRibo', 'HRibo'),
+                                    values = brewer.pal(name = 'Spectral', n=10))
+  cat('###', sample,"\n\n")
+  print(
+    CombinePlots(ncol = 2, plots = list(
+    ggplot(data = tmp.dat, aes(row, feature, color = desc)) + geom_point(size = 0.5) + theme + scale_color + labs(title = paste0(sample, " Feature Counts")),
+    ggplot(data = tmp.dat, aes(row, count, color = desc))   + geom_point(size = 0.5) + theme + scale_color + labs(title = paste0(sample, " RNA Counts")),
+    ggplot(data = tmp.dat, aes(row, ratio, color = desc ))  + geom_point(size = 0.5) + theme + scale_color + labs(title = paste0(sample, " Count / Feature Ratio")),
+    ggplot(data = tmp.dat, aes(row, p.mito, color = desc))  + geom_point(size = 0.5) + theme + scale_color + labs(title = paste0(sample, " p.mito")),
+    ggplot(data = tmp.dat, aes(row, p.ribo, color = desc))  + geom_point(size = 0.5) + theme + scale_color + labs(title = paste0(sample, " p.ribo")) + theme(legend.position = 'right', legend.title = element_blank()) + guides(colour = guide_legend(override.aes = list(size=5)))
+    )
+    )
+  )
+  cat("\n\n")
+  rm(tmp.dat, theme)
+  
+}
+```
+
+## - Subsetting from the above
+
+```{r Subsetting Data, include=TRUE, eval=TRUE}
+originalSamples    = duplicate(samples,shallow=FALSE)
+
+cat(paste0("The High Ratio (HRatio) tag applies to cells with a higher Counts to Features ratio than: ", b_hratio,".\n"))
+cat(paste0("The High Mito (HMito) tag applies to cells with a higher mitochondrial activity than: ", b_hmito,".\n"))
+cat(paste0("The High Ribo (HRibo) tag applies to cells with a higher ribosomal activity than: ", b_hribo,".\n"))
+cat(paste0("The Low Feature (LFeature) tag applies to cells with a lower number of features than: ", b_lfeature,".\n"))
+cat(paste0("The Low Counts (LCount) tag applies to cells with a lower counts number than: ", b_lcount,".\n"))
+
+rm(b_hratio, b_hmito, b_hribo, b_lfeature, b_lcount) #clean up a bit
+
+samples = duplicate(originalSamples, shallow = FALSE) # The subset of the original Samples
+for( sample in names(samples) ) {
+  samples[[sample]] <- subset(x = originalSamples[[sample]], cells = which(originalSamples[[sample]]@meta.data$description %in% c('Default','HRibo', "HMitoHRibo")) )
+}
+```
+
+##  - Doublet Removal
+```{r Doublet_Removal, include=FALSE, eval=TRUE}
+
+# Normalize sample data and identify genes with high dispersion
+for( x.sample in names(samples) ) {
+    samples[[x.sample]] <- NormalizeData(samples[[x.sample]], verbose = FALSE)
+    samples[[x.sample]] <- FindVariableFeatures(samples[[x.sample]], selection.method = 'vst', nfeatures = 2000, verbose = FALSE)
+    samples[[x.sample]] <- ScaleData(samples[[x.sample]])
+    samples[[x.sample]] <- RunPCA(samples[[x.sample]])
+    samples[[x.sample]] <- FindNeighbors(samples[[x.sample]], reduction = 'pca', dims = 1:10)
+    samples[[x.sample]] <- FindClusters(samples[[x.sample]], resolution = 0.5, verbose = run.print.progress)
+    samples[[x.sample]] <- RunUMAP(samples[[x.sample]], dims = 1:10)
+    
+    # Estimating proportion of hetero/homotypic doublets (see https://github.com/chris-mcginnis-ucsf/DoubletFinder)
+    num_expected = round(0.025 * nrow(samples[[x.sample]]@meta.data) * (1 - DoubletFinder::modelHomotypic(samples[[x.sample]]@meta.data$seurat_clusters) ) )
+
+    sweep.res.list_sample <- DoubletFinder::paramSweep_v3(samples[[x.sample]], PCs = 1:10, sct = FALSE)
+    sweep.stats_sample <- DoubletFinder::summarizeSweep(sweep.res.list_sample, GT = FALSE)
+    bcmvn_sample <- find.pK(sweep.stats_sample)
+    max_bcmvn <- max(bcmvn_sample$BCmetric)
+    pkvalue <- as.numeric(bcmvn_sample[bcmvn_sample$BCmetric == max_bcmvn,]$pK)
+
+    print(paste0("The pk value of ",pkvalue ," corresponds to the maximum BCmvn of: ",max_bcmvn))
+
+    samples[[x.sample]] <- DoubletFinder::doubletFinder_v3(samples[[x.sample]], PCs = 1:10, pK = pkvalue, nExp =  num_expected )
+    
+    rm(num_expected, sweep.res.list_sample, sweep.stats_sample, bcmvn_sample, max_bcmvn, pkvalue)
+}
+# Remove predicted doublets
+for( x.sample in names(samples) ) {
+  DF.column <- grep('DF.classification', colnames(samples[[x.sample]][[]]), value = T)[1]
+
+      samples[[x.sample]] <- subset(x = samples[[x.sample]], cells = which( samples[[x.sample]][[DF.column]] == 'Singlet')  )
+}
+
+```
+
+# - Merging Samples and Dimension Reduction
+
+```{r Dimension Reduction, include=TRUE, eval=TRUE}
+for( sample in names(samples) ) {
+  samples[[sample]] <- NormalizeData(samples[[sample]], verbose = FALSE)
+  samples[[sample]] <- FindVariableFeatures(samples[[sample]], selection.method = 'vst', nfeatures = 2000, verbose = FALSE)
+}
+
+integrated.anchors <- FindIntegrationAnchors(object.list = samples, dims = 1:50, verbose = run.print.progress) # Runtime: 20m (approximate)
+integrated <- IntegrateData(anchorset = integrated.anchors, dims = 1:50, verbose = run.print.progress)
+
+integrated <- ScaleData(integrated, verbose = run.print.progress)
+integrated <- RunPCA(integrated, npcs = 50, verbose = run.print.progress)
+ElbowPlot(integrated, ndims = 50)
+integrated <- JackStraw(integrated, num.replicate = 100, dims = 50, verbose = run.print.progress) 
+#~40 minutes to run on ShinyR @dims=20 && replicates=100; ~3hrs to run on ShinyR @dims=50 && replicates = 100
+integrated <- ScoreJackStraw(integrated, dims = 1:50)
+JackStrawPlot(integrated, dims = 1:50)
+
+```
+
+```{r Setting Analysis Dimensions, include=TRUE, eval=TRUE}
+analysis.dims <- 1:40     # Setting my dimensions
+
+```
+
+# - Clustering
+```{r Clustering Setup}
+#Overload with the desired order (the last one is the one used for the analysis)
+clusteringLevels <- c(0.8, 0.2, 0.5)
+clusteringLevelsLabels <- c('High Resolution', 'Low Resolution', "Medium Resolution")
+```
+
+## - Clustering Graphs {.tabset}
+```{r Clustering, fig.width=14, fig.height=18, include=TRUE, eval=TRUE, results='asis', fig.show='asis'}
+
+for(i in 1:length(clusteringLevels)){
+  r <- clusteringLevels[i]
+  label <- clusteringLevelsLabels[i]
+  integrated <- FindNeighbors(integrated, reduction = 'pca', dims = analysis.dims)
+  integrated <- FindClusters(integrated, resolution = r, verbose = run.print.progress)
+  integrated <- RunUMAP(integrated, reduction = 'pca', dims = analysis.dims, verbose = run.print.progress)
+  
+  cat('###', label,"\n\n")
+  print(
+    CombinePlots(ncol = 1, plots = list(
+  DimPlot(integrated,pt.size = 1, label = TRUE, reduction = 'umap', order = TRUE) + labs(title = 'Cells by Cluster', repel=TRUE), #note new point size and order=TRUE
+  DimPlot(integrated,pt.size = 1, reduction = 'umap', group.by = 'orig.ident', order=TRUE) + labs(title = 'Cells by Cluster', repel=TRUE)
+    )))
+  if(i == length(clusteringLevels)){ #only stash cluster idents if it's the last run resolution level
+    integrated[['cluster']] <- Idents(integrated) # Stash our cluster idents
+    }
+  cat('\n\n')
+  rm(r, label)
+}
+```
+
+## - Percent Counts of each Sample by Cluster
+Each column adds up to 100 %.
+```{r Percent Counts of each Sample by Cluster, include=TRUE, eval=TRUE}
+cat("Percent Counts of each Sample by Cluster\n")
+sweepmatrix <- sweep(as.matrix(table(integrated[['cluster']][,1],integrated[['orig.ident']][,1])),2,c(t(table(integrated[['orig.ident']])))/100,'/')
+print(sweepmatrix)
+
+cat("\n\nNumber of cells per sample\n")
+sampTable<-table(integrated[['orig.ident']][,1])
+sampTable
+```
+
+## - Stacked Barchart of Each Cluster's Sample Composition (Real Counts)
+```{r Stacked Barchart Real counts, include=TRUE, eval=TRUE}
+df<-sweep(as.matrix(table(integrated[['cluster']][,1],integrated[['orig.ident']][,1])),2,c(t(table(integrated[['orig.ident']])))/100,'/')
+data<-as.data.frame(df)
+names(data)<-c("Clusters", "Samples", "Real_Counts")
+sampTable<-table(integrated[['orig.ident']][,1])
+for(r in 1:nrow(data)){
+  data[r,]$Real_Counts<-(data[r,]$Real_Counts)*as.numeric(sampTable[data[r,]$Samples][1])/100
+}
+ggplot(data, aes(fill=Samples, y=Real_Counts,x=Clusters))+geom_bar(positions="stack", stat="identity")
+```
+
+## - Stacked Barchart of Each Cluster's Percent composition of each Sample
+```{r Stacked Barchart of Each Clusters Percent composition of each Sample, include=TRUE, eval=TRUE}
+clusterPercents <- sweepmatrix
+for(row in 1:nrow(sweepmatrix)){
+  rowsum=0
+  for(col in 1:ncol(sweepmatrix)){
+    rowsum=(sweepmatrix[row,col]*as.numeric(sampTable[col][1])/100)+rowsum
+  }
+  for(col in 1:ncol(sweepmatrix)){
+    clusterPercents[row,col]=(sweepmatrix[row,col]*as.numeric(sampTable[col][1])/100)/rowsum*100
+  }
+  
+}
+data<-as.data.frame(clusterPercents)
+names(data)<-c("Clusters", "Samples", "Cluster_Percents")
+sampTable<-table(integrated[['orig.ident']][,1])
+ggplot(data, aes(fill=Samples, y=Cluster_Percents,x=Clusters))+geom_bar(positions="stack", stat="identity")
+```
+
+## - Stacked Barchart By Sample
+
+```{r Stacked Barchart by Sample, include=TRUE, eval=TRUE}
+df<-sweep(as.matrix(table(integrated[['cluster']][,1],integrated[['orig.ident']][,1])),2,c(t(table(integrated[['orig.ident']])))/100,'/')
+data<-as.data.frame(df)
+names(data)<-c("Clusters", "Samples", "Real_Counts")
+sampTable<-table(integrated[['orig.ident']][,1])
+for(r in 1:nrow(data)){
+  data[r,]$Real_Counts<-(data[r,]$Real_Counts)*as.numeric(sampTable[data[r,]$Samples][1])/100
+}
+ggplot(data, aes(fill=Clusters, y=Real_Counts,x=Samples))+geom_bar(positions="stack", stat="identity")
+```
+
+## - Stacked Barchart Percents by Sample
+
+```{r Stacked Barchart Percents by Sample, include=TRUE, eval=TRUE}
+clusterPercents <- sweepmatrix
+
+#Column and Row are mislabeled and misleading but THIS WORKS.
+# Row = cluster +1
+# Col = sample
+# rowsum = number of cells in that cluster (determined below)
+for(row in 1:nrow(sweepmatrix)){  
+  rowsum=0
+  for(col in 1:ncol(sweepmatrix)){ #find out how many cells are in each cluster
+
+    # sweepmatrix[row,col]           -> ___% of cluster ___ is made up by sample X 
+    # as.numeric(sampTable[col][1])) -> #number of cells in sample X
+    
+    rowsum=(sweepmatrix[row,col]*as.numeric(sampTable[col][1])/100)+rowsum
+  }
+  for(col in 1:ncol(sweepmatrix)){
+    clusterPercents[row,col]=(sweepmatrix[row,col]*as.numeric(sampTable[col][1])/100)/as.numeric(sampTable[col][1])*100
+  }
+}
+data<-as.data.frame(clusterPercents)
+names(data)<-c("Clusters", "Samples", "Cluster_Percents")
+sampTable<-table(integrated[['orig.ident']][,1])
+
+ggplot(data, aes(fill=Clusters, y=Cluster_Percents,x=Samples))+geom_bar(positions="stack", stat="identity")
+```
+
+## - Clustering With each sample picked out {.tabset}
+
+```{r Medium Res Clustering Sample color coding, , include=TRUE, eval=TRUE, results='asis', fig.show='asis'}
+position <- 1
+for( x.sample in names(samples) ) {
+  len <- as.numeric(length(names(samples)))
+  if(position == 1){ #the first sample edge case
+    colorsVector <- c('red',rep('lightgrey',len - 1))
+  }else if(position == len){ #the last sample edge case
+    colorsVector <- c(rep('lightgrey',position-1),'red')
+  }else{ #in the middle (normal) case
+    colorsVector <- c(rep('lightgrey',position-1),'red', rep('lightgrey',len-position))
+  }
+  position <- position + 1
+  
+  plotTitle <- paste0("[Medium Resolution] Cells of Sample: ",x.sample)
+  cat("###", x.sample, "\n\n")
+  dp <- DimPlot(integrated, label = FALSE, reduction = 'umap', group.by = 'orig.ident', cols = colorsVector) + labs(title = plotTitle) #
+  print(dp)
+  cat("\n\n")
+}
+```
+
+# - Checking For Genes in Cells
+
+## - Checking Some Genes of interest are in Cell Samples
+
+```{r Gene Check 1, include=TRUE, eval=TRUE}
+try(FeaturePlot(integrated,features= 'ZBTB7B',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'CD4',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'BCL11B',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'SATB1',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'FOXP3',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'MYC',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'MYB',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'LMO1',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'LMO2',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'LMO4',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'CD44',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'RUNX3',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'RUNX1',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'TBX21',min.cutoff = 0))
+try(FeaturePlot(integrated,features= 'RORC',min.cutoff = 0))
+```
+
+```{r Cell Determination Gene Check 2, include=TRUE, eval=TRUE}
+try(FeaturePlot(integrated,features = 'CD3D', min.cutoff = 0))
+try(FeaturePlot(integrated,features = 'TRBC2',min.cutoff = 0)) 
+try(FeaturePlot(integrated,features = 'IL7R', min.cutoff = 0)) 
+try(FeaturePlot(integrated,features = 'CCR7', min.cutoff = 0))
+
+try(FeaturePlot(integrated,features = 'CD14', min.cutoff = 0))   
+try(FeaturePlot(integrated,features = 'LYZ' , min.cutoff = 0))    # 
+try(FeaturePlot(integrated,features = 'CD68', min.cutoff = 0))
+
+try(FeaturePlot(integrated,features = 'FCGR3A', min.cutoff = 0))  # 
+try(FeaturePlot(integrated,features = 'MS4A7' , min.cutoff = 0))  
+
+try(FeaturePlot(integrated, features ='IL7R'   , min.cutoff = 0))
+try(FeaturePlot(integrated, features = 'S100A4', min.cutoff = 0))
+
+try(FeaturePlot(integrated, features = 'CD79A', min.cutoff = 0))
+try(FeaturePlot(integrated, features = 'MS4A1', min.cutoff = 0))
+
+try(FeaturePlot(integrated, features = 'CD3D', min.cutoff = 0))  
+try(FeaturePlot(integrated, features = 'CD8A', min.cutoff = 0)) 
+try(FeaturePlot(integrated, features = 'CD8B', min.cutoff = 0)) # 
+
+try(FeaturePlot(integrated, features = 'FCGR3A', min.cutoff = 0)) # 
+try(FeaturePlot(integrated, features = 'MS4A7' , min.cutoff = 0))
+
+try(FeaturePlot(integrated, features = 'GNLY', min.cutoff = 0)) # 
+try(FeaturePlot(integrated, features = 'NKG7', min.cutoff = 0))
+
+try(FeaturePlot(integrated, features = 'CST3'  , min.cutoff = 0))
+try(FeaturePlot(integrated, features = 'FCER1A', min.cutoff = 0))
+
+try(FeaturePlot(integrated, features = 'GZMB'    , min.cutoff = 0))
+try(FeaturePlot(integrated, features = 'IL3RA'   , min.cutoff = 0))
+try(FeaturePlot(integrated, features = 'SERPINF1', min.cutoff = 0))
+try(FeaturePlot(integrated, features = 'ITMC'    , min.cutoff = 0))
+
+try(FeaturePlot(integrated, features = 'PPBP', min.cutoff = 1))  
+try(FeaturePlot(integrated, features = 'HBB' , min.cutoff = 1)) 
+
+try(FeaturePlot(integrated, features = 'TRGC2'    , min.cutoff = 0))  
+try(FeaturePlot(integrated, features = 'TRGC1'    , min.cutoff = 0))  
+try(FeaturePlot(integrated, features = 'TRBC1'    , min.cutoff = 0))  
+try(FeaturePlot(integrated, features = 'TRBC2'    , min.cutoff = 0))  
+try(FeaturePlot(integrated, features = 'TRDC'     , min.cutoff = 0))
+try(FeaturePlot(integrated, features = 'TRAC'     , min.cutoff = 0))  
+
+VlnPlot(integrated, features = 'nCount_RNA', pt.size = 0.1)
+VlnPlot(integrated, features = 'nFeature_RNA', pt.size = 0.1)
+VlnPlot(integrated, features = 'p.mito', pt.size = 0.1)
+```
+
+## - A Heat Map can be generated from the data
+
+```{r Heat Map,fig.height=25,fig.width=15, include=TRUE, eval=TRUE}
+markers <- FindAllMarkers(integrated, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+saveRDS(markers, file = 'macs.markers.rds') # markers <- readRDS('macs.markers.rds')
+
+top <- markers %>% group_by(cluster) %>% top_n(n = 15, wt = avg_log2FC)
+DoHeatmap(integrated, features = top$gene, size = 5) + NoLegend()
+
+```
+
+# - Differential Gene Expression (Using Medium Resolution Clustering)
+
+## - Cluster Identification
+
+We'll now use SingleR to perform some unsupervised cluster identification
+
+``` {r SingleR Cluster Prediction, fig.width=12, include=TRUE, eval=TRUE}
+DimPlot(integrated, reduction = 'umap', label = TRUE, group.by = 'cluster') + labs(title = 'Original Clusters (from above)')
+
+ref_type <- "mouse" #set the ref_type
+cat(paste0("Reference type: ",ref_type,"\n"))
+
+#Download and cache references:
+
+ref <- MouseRNAseqData() 
+cat(paste0("This reference consists of a collection of 
+             mouse bulk RNA-seq data sets downloaded from
+             the gene expression omnibus (Benayoun et al. 2019). 
+             A variety of cell types are available, again
+             mostly from blood but also covering several 
+             other tissues.\n"))
+cat(paste0("Benayoun, Bérénice A., Elizabeth A. Pollina, 
+             Param Priya Singh, Salah Mahmoudi, Itamar Harel, 
+             Kerriann M. Casey, Ben W. Dulken, Anshul Kundaje,
+             and Anne Brunet. 2019. “Remodeling of epigenome
+             and transcriptome landscapes with aging in mice
+             reveals widespread induction of inflammatory
+             responses.” Genome Research 29: 697–709.
+             https://doi.org/10.1101/gr.240093.118.\n"))
+  
+pred <- SingleR(test = Seurat::as.SingleCellExperiment(integrated), ref = ref, labels = ref$label.main)
+
+integrated[['predicted']] <- pred$labels
+Idents(integrated) <- integrated[['predicted']]
+title <- paste0('Predicted Type using the ',ref_type,' Reference.')
+DimPlot(integrated, reduction = 'umap', label = TRUE, group.by = 'predicted') + labs(title = 'Predicted Type')
+
+```
+
+The following is a table listing cell types and their number.
+
+```{r Show Predicted Cell Type Populations, include=TRUE, eval=TRUE}
+table(integrated[['predicted']])
+```
+
+## - Sample Comparison
+
+```{r Change idents type to Samples, include = FALSE, eval=TRUE}
+Idents(integrated) <- integrated[['orig.ident']] #this changes the idents to samples
+```
+
+## - Sample vs Sample Comparisons {.tabset}
+
+### - 19T vs CD19_NKT
+
+```{r, rows.print=20, results='asis'}
+df <- FindMarkers(integrated, ident.1 = "19T", ident.2 = "CD19_NKT", verbose=run.print.progress)
+paged_table(df[df$p_val_adj<0.05,])
+```
+
+### - 19T vs NT_NKT
+
+```{r, rows.print=20, results='asis'}
+df <- FindMarkers(integrated, ident.1 = "19T", ident.2 = "NT_NKT", verbose=run.print.progress)
+paged_table(df[df$p_val_adj<0.05,])
+```
+
+### - 19T vs NT_T
+
+```{r, rows.print=20, results='asis'}
+df <- FindMarkers(integrated, ident.1 = "19T", ident.2 = "NT_T", verbose=run.print.progress)
+paged_table(df[df$p_val_adj<0.05,])
+```
+
+### - CD19_NKT vs NT_NKT
+
+```{r, rows.print=20, results='asis'}
+df <- FindMarkers(integrated, ident.1 = "CD19_NKT", ident.2 = "NT_NKT", verbose=run.print.progress)
+paged_table(df[df$p_val_adj<0.05,])
+```
+
+### - CD19_NKT vs NT_T
+
+```{r, rows.print=20, results='asis'}
+df <- FindMarkers(integrated, ident.1 = "CD19_NKT", ident.2 = "NT_T", verbose=run.print.progress)
+paged_table(df[df$p_val_adj<0.05,])
+```
+
+### - NT_NKT vs NT_T
+
+```{r, rows.print=20, results='asis'}
+df <- FindMarkers(integrated, ident.1 = "NT_NKT", ident.2 = "NT_T", verbose=run.print.progress)
+paged_table(df[df$p_val_adj<0.05,])
+```
+
+## - Gene Signatures {.tabset}
+
+```{r signatures, results='asis', fig.show='asis'}
+#change casing of the genes in a new cloned integrated object
+casing_integrated <- integrated
+casing_integrated@assays[["RNA"]]@data@Dimnames[[1]] <- str_to_title(casing_integrated@assays[["RNA"]]@data@Dimnames[[1]])
+casing_integrated@assays[["integrated"]]@data@Dimnames[[1]] <- str_to_title(casing_integrated@assays[["integrated"]]@data@Dimnames[[1]])
+casing_integrated@assays[["integrated"]]@var.features <- str_to_title(casing_integrated@assays[["integrated"]]@var.features)
+
+Idents(casing_integrated) <- integrated[['cluster']]
+DefaultAssay(casing_integrated) <- 'RNA'
+
+source('imgftools_scseq.R')
+casing_integrated <- runSeuratSignatures(casing_integrated, ref.file = 'xinZhou10x_single_cell_groups.tsv',print.graphics = TRUE, heading.level = 3)
+
+```
+
+## - The full citation for the Stubbington gene signatures:
+Stubbington MJ, Mahata B, Svensson V, Deonarine A, Nissen JK, Betz AG, Teichmann SA. An atlas of mouse CD4(+) T cell transcriptomes. Biol Direct. 2015 Apr 3;10:14. doi: 10.1186/s13062-015-0045-x. PMID: 25886751; PMCID: PMC4384382.
+
+## - Comparing NT-NKT vs NT-T
+
+```{r fig.height=25,fig.width=15, include=TRUE, eval=TRUE}
+nkt_t_integrated <- subset(x = integrated, subset = orig.ident == c("NT_NKT","NT_T" ) )
+
+Idents(nkt_t_integrated) <- nkt_t_integrated[['orig.ident']] #this changes the idents to samples
+markers <- FindMarkers(nkt_t_integrated, ident.1 = "NT_NKT", ident.2 = "NT_T", verbose=run.print.progress)
+      
+markers <- markers[markers$p_val_adj<0.05,]
+markers <- markers[order(markers$avg_log2FC),]
+
+DoHeatmap(nkt_t_integrated, features = rownames(markers), size = 5) + NoLegend()
+```
+
+## - Checking for genes individually by group.
+
+### - Group 1 {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- c("PDCD1", "HAVCR2", "LAG3", "CTLA4", "TIGIT", "CD101")
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+
+```
+
+### - Group 2 {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- c("CD1D1", "CD1D2")
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+
+```
+
+### - Group 3 {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- toupper(c("Ifng", "Gzmb", "Gzma", "Tnf", "Gnly"))
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+
+```
+
+### - Group 4 {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- toupper(c("Cd69", "Itgae", "Il2ra", "Il7r", "Nk1.1", "Sell", "Ccr7", "Ly108", "Cxcr5", "Klra1", "Serpina3f", "Ramp1", "P2rx7", "Mki67"))
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+
+```
+
+### - Group 5 {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- toupper(c("Tcf7", "Tox", "Tbx21", "Eomes", "Prdm1", "Runx3", "Klf2"))
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+
+```
+
+### - Checking for the CAR Transgene
+
+```{r results='asis', fig.show='asis'}
+group <- toupper(c("MILNERCARTRANSGENE"))
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Group 6 {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- toupper(c("Emr1", "Ly6c1", "Ly6c2", "Ly6g", "Ly6g2", "Itgam", "Itgax", "Itga1", "Klra7", "Klra9", "Ramp3", "Klrb1c", "Klrk1", "Ncr1"))
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+
+### - Special clustering graph
+
+```{r results='asis', fig.show='asis', fig.width=14, fig.height=7,}
+
+for(samp in sample.list){
+  Idents(integrated) <- integrated[['orig.ident']]#this changes the idents to samp idents
+  WhichResults <- WhichCells(integrated, idents = sample.list[! sample.list %in% samp])
+  integrated[['graph']] <- integrated[['cluster']] #now create a new ident that is a clone of cluster
+  Idents(integrated) <- integrated[['graph']]#this changes the active idents to graphing (cluster but we are about to make some changes)
+  Idents(integrated, cells=WhichResults)<- 'Other Samples\' Cells' # sample.list[! sample.list %in% samp]   
+  integrated[['graph']]<-Idents(integrated)
+  numClusters = nrow(unique(integrated[['cluster']])) #automatically adjusts to # of clusters we have
+  color_hexes <- hue_pal()(numClusters) #change this number to the number of clusters We have
+  group_color_list <- c('#D3D3D3',color_hexes) # #D3D3D3 is lightgrey
+  print(DimPlot(integrated,pt.size = .3,cols=group_color_list,label = TRUE, group.by = 'graph',reduction = 'umap', order = TRUE) + labs(title = paste0('Cells by Cluster (only sample: ',samp,')'), repel=TRUE) )
+  integrated[['graph']] = NULL
+}
+```
+
+### - Check for CSF1R
+
+```{r}
+try(FeaturePlot(integrated,features = 'CSF1R', min.cutoff = 0))
+```
+
+
+## - Focusing on Clusters 10 and 15
+
+### - Subset for clusters 10 and 15 and recluster {.tabset}
+```{r subset_clusters_10_15 , fig.width=9, fig.height=12, results='asis', fig.show='asis',eval=FALSE}
+
+integrated[['graph']] <- integrated[['cluster']]
+
+ss_integrated <- subset(x = integrated, subset = cluster == c(10,15))
+
+for(i in 1:length(clusteringLevels)){
+  r <- clusteringLevels[i]
+  label <- clusteringLevelsLabels[i]
+  ss_integrated <- FindNeighbors(ss_integrated, reduction = 'pca', dims = analysis.dims)
+  ss_integrated <- FindClusters(ss_integrated, resolution = r, verbose = run.print.progress)
+  ss_integrated <- RunUMAP(ss_integrated, reduction = 'pca', dims = analysis.dims, verbose = run.print.progress)
+  
+  cat('####', label,"\n\n")
+
+  print(
+    CombinePlots(ncol = 1, plots = list(
+  DimPlot(ss_integrated,pt.size = 1, label = TRUE, reduction = 'umap', order = TRUE) + labs(title = 'Cells by Cluster', repel=TRUE), #note new point size and order=TRUE
+  DimPlot(ss_integrated,pt.size = 1, reduction = 'umap', group.by = 'orig.ident', order=TRUE) + labs(title = 'Cells by Cluster', repel=TRUE)
+    )))
+
+  if(i == clusteringLevels){
+    ss_integrated[['cluster']] <- Idents(ss_integrated) # Stash our cluster idents
+    }
+  
+  cat('\n\n')
+  rm(r, label)
+}
+```
+
+
+```{r eval=FALSE}
+sigs <- list( #create a named list (required)
+
+'M1' = c('GBP5', 'GBP1', 'SOD2', 'IRF1', 'STAT1', 'IDO1', 'HLA-DRB5', 'SNTSF10', 'HIF1A', 'S100A9', 'CXCL9', 'STAT3', 'CCL4', 'IFI27'),
+'M2A' = c('STAT3','IL4I1','SOCS1','CD36','CD209','CD163','CCL13','MRC1'),
+'M2B' = c('HLA-DRB5', 'STAT3', 'HIF1A'),
+'M2C' = c('CCL18', 'STAT3', 'TLR8', 'TLR1', 'TIMP1', 'MARCO', 'CD163', 'MRC1'),
+'M2D' = c('CCL18','MSR1','CD163', 'LYVE1')
+)
+obj <- ss_integrated
+obj <- Seurat::AddModuleScore(obj, features = sigs, name = 'IMGF', assay = 'RNA', search = TRUE) # each element of the named list takes the name IMGF1, IMGF2, etc...
+```
+
+### - Check Macrophage types
+
+Red indicates stronger expression of the groups of genes.
+
+#### - M1
+```{r fig.width=6, fig.height=6, results='asis', fig.show='asis',eval=FALSE}
+sig.feature_name <- 'IMGF1'
+sig.description <- 'M1 Macrophage'
+sig.citation <- 'https://www.frontiersin.org/articles/10.3389/fmed.2021.665873/full'
+print(
+        Seurat::FeaturePlot(obj, features = sig.feature_name) + 
+        ggplot2::scale_colour_gradientn(colours = rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu"))) + ggplot2::theme_minimal() + Seurat::NoAxes() + ggplot2::labs(title = sig.description, caption = sig.citation),
+      )
+```
+
+#### - M2A
+```{r fig.width=6, fig.height=6, results='asis', fig.show='asis',eval=FALSE}
+sig.feature_name <- 'IMGF2'
+sig.description <- 'M2A Macrophage'
+sig.citation <- 'https://www.frontiersin.org/articles/10.3389/fmed.2021.665873/full'
+print(
+        Seurat::FeaturePlot(obj, features = sig.feature_name) + 
+        ggplot2::scale_colour_gradientn(colours = rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu"))) + ggplot2::theme_minimal() + Seurat::NoAxes() + ggplot2::labs(title = sig.description, caption = sig.citation),
+      )
+```
+
+#### - M2B
+```{r fig.width=6, fig.height=6, results='asis', fig.show='asis',eval=FALSE}
+sig.feature_name <- 'IMGF3'
+sig.description <- 'M2B Macrophage'
+sig.citation <- 'https://www.frontiersin.org/articles/10.3389/fmed.2021.665873/full'
+
+print(
+        Seurat::FeaturePlot(obj, features = sig.feature_name) + 
+        ggplot2::scale_colour_gradientn(colours = rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu"))) + ggplot2::theme_minimal() + Seurat::NoAxes() + ggplot2::labs(title = sig.description, caption = sig.citation),
+      )
+```
+
+#### - M2C
+```{r fig.width=6, fig.height=6, results='asis', fig.show='asis',eval=FALSE}
+sig.feature_name <- 'IMGF4'
+sig.description <- 'M2C Macrophage'
+sig.citation <- 'https://www.frontiersin.org/articles/10.3389/fmed.2021.665873/full'
+print(
+        Seurat::FeaturePlot(obj, features = sig.feature_name) + 
+        ggplot2::scale_colour_gradientn(colours = rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu"))) + ggplot2::theme_minimal() + Seurat::NoAxes() + ggplot2::labs(title = sig.description, caption = sig.citation),
+      )
+```
+
+#### - M2D
+```{r fig.width=6, fig.height=6, results='asis', fig.show='asis',eval=FALSE}
+sig.feature_name <- 'IMGF5'
+sig.description <- 'M2D Macrophage'
+sig.citation <- 'https://www.frontiersin.org/articles/10.3389/fmed.2021.665873/full'
+print(
+        Seurat::FeaturePlot(obj, features = sig.feature_name) + 
+        ggplot2::scale_colour_gradientn(colours = rev(RColorBrewer::brewer.pal(n = 11, name = "RdBu"))) + ggplot2::theme_minimal() + Seurat::NoAxes() + ggplot2::labs(title = sig.description, caption = sig.citation),
+      )
+```
+
+## - RidgePlot of Cd1d
+
+```{r fig.width=15, fig.height=15, results='asis', fig.show='asis'}
+# Get a seurattObject with only cells expressing Cd1d included
+Idents(integrated) <- integrated[['predicted']]
+#Idents(integrated) <- integrated[['cluster']]
+bool_cd1d1 <- FetchData(object = integrated, vars = 'CD1D1') #pulls column of all cell's levels of CD1D1
+bool_cd1d1 = bool_cd1d1[bool_cd1d1$rna_CD1D1 > 0, ,drop=FALSE] #  EXTRA COMMA INTENTIONAL! drops any cells not meeting the expression threshold
+
+cell_names_cd1d1 <- row.names(bool_cd1d1) #save cell names of cells that meet the expression criteria
+cd1d_int <- subset(x = integrated, cells = cell_names_cd1d1) #create subset of integrated looking only at cells expression cd1d1
+
+RidgePlot(object = integrated, features = 'CD1D1')
+RidgePlot(object = cd1d_int, features = 'CD1D1')
+```
+
+### - Violin Plots of Cd1d1 expression
+
+```{r Violin Plots of Cd1d1 expression, fig.width=6, fig.height=6, results='asis', fig.show='asis'}
+Idents(integrated) <- integrated[['cluster']]
+
+VlnPlot(object = integrated, features = 'CD1D1') + labs(title = 'Violin Plot of Cd1d1 expression without Prefiltering', repel=TRUE)
+
+Idents(cd1d_int) <- cd1d_int[['cluster']]
+VlnPlot(object = cd1d_int, features = 'CD1D1') + labs(title = 'Violin Plot of Cd1d1 expression with Prefiltering', repel=TRUE)
+```
+
+## - New Cartransgene checking methods
+
+### - Violin Plot of Cartransgene
+```{r}
+bool_cartransgene <- FetchData(object = integrated, vars = 'MILNERCARTRANSGENE') #pulls column of all cell's levels of cartransgene
+bool_cartransgene = bool_cartransgene[bool_cartransgene$rna_MILNERCARTRANSGENE > 0, ,drop=FALSE] #  EXTRA COMMA INTENTIONAL! drops any cells not meeting the expression threshold
+
+cell_names_cartransgene <- row.names(bool_cartransgene) #save cell names of cells that meet the expression criteria
+
+cartransgene_int <- subset(x = integrated, cells = cell_names_cartransgene) #create subset of integrated looking only at cells expression cartransgene
+VlnPlot(object = cartransgene_int, features = 'MILNERCARTRANSGENE') + labs(title = 'Violin Plot of MILNERCARTRANSGENE expression with Prefiltering', repel=TRUE)
+```
+
+### - Alternative Feature Plot of CarTransgene
+```{r}
+library(viridis)
+pal <- viridis(n = 10, option = "C", direction = -1)
+print(FeaturePlot(integrated,features= 'MILNERCARTRANSGENE',min.cutoff = 0, pt.size = 1 , keep.scale = NULL, order=TRUE, cols = pal ))
+```
+
+## - More requested genes by group
+
+This section goes through the requested gene groups and creates feature plots for genes not previously searched for.
+
+```{r}
+m1_group <- c( 'ADGRE1' , 'C1QA' , 'VCAM1' )
+
+m2_group <- c('CLEC10A' , 'FOLR2' , 'SEPP1' , 'APOE', 'MAF')
+
+monocyte_group <- c('IL1B' , 'CXCL10A' , 'MS4A4C')
+
+mdsc_group <- c('ARG1' , 'NOS2' , 'PF4' , 'IL1RN')
+
+neutrophil_group <- c('HP' , 'MSRB1' , 'NCF2')
+
+cd11b_pos_group <- c('ZBTB46' , 'CD209A' , 'H2-EB1')
+
+modc_group <- c('CLEC4B1' , 'CCL24' , 'CCR2', 'H2-DMA' , 'H2-AB1')
+
+cd103_pos_cdc_group <- c('FLT3' , 'BATF3' , 'CLEC9A' , 'XCR1' , 'CD24A' , 'CD103')
+
+migratory_cdc_group <- c('RELB' , 'CCL22')
+
+stromal_group <- c('SPARC' , 'DCN' , 'IGFBP1' , 'COL3A1')
+
+plasmacytoid_dc_group <- c('CCR9' , 'SIGLECH', 'BST2')
+
+mki67_pos_cd8_pos_group <- c('CD3G' , 'TOP2A' , 'CENPE', 'CDK4' , 'THY1')
+
+mki67_neg_cd8_pos_group <- c('CCL5')
+
+nk_group <- c('KLRE1')
+
+treg_group <- c('CD28' , 'IKZF2')
+
+```
+
+### - M1 Macrophage Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- m1_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - M2 Macrophage Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- m2_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Monocyte Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- monocyte_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - MDSC Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- mdsc_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Neutrophil Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- neutrophil_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - CD11b+ cDC Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- cd11b_pos_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - MoDC Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- modc_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - CD1-3+ cDC Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- cd103_pos_cdc_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Migratory cDC Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- migratory_cdc_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Stromal Cell Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- stromal_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Plasmacytoid DC Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- plasmacytoid_dc_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Mki67+ CD8+ Tcell Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- mki67_pos_cd8_pos_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Mki67- CD8+ T Cell Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- mki67_neg_cd8_pos_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - NK Cell Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- nk_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+### - Treg Group {.tabset}
+```{r results='asis', fig.show='asis'}
+group <- treg_group
+for(gene in group){
+  cat("####", gene, "\n\n")
+  try(print(FeaturePlot(integrated,features= gene,min.cutoff = 0)))
+  cat("\n\n")
+}
+```
+
+## - Gene Signatures Part II {.tabset}
+
+```{r signatures_2, results='asis', fig.show='asis'}
+casing_integrated <- integrated
+casing_integrated@assays[["RNA"]]@data@Dimnames[[1]] <- str_to_title(casing_integrated@assays[["RNA"]]@data@Dimnames[[1]])
+casing_integrated@assays[["integrated"]]@data@Dimnames[[1]] <- str_to_title(casing_integrated@assays[["integrated"]]@data@Dimnames[[1]])
+casing_integrated@assays[["integrated"]]@var.features <- str_to_title(casing_integrated@assays[["integrated"]]@var.features)
+
+Idents(casing_integrated) <- integrated[['cluster']]
+DefaultAssay(casing_integrated) <- 'RNA'
+casing_integrated <- runSeuratSignatures(casing_integrated, ref.file = 'xinZhou_key_differentially_expressed_gene_groups.tsv',print.graphics = TRUE, heading.level = 3) #uses original ref file
+
+```

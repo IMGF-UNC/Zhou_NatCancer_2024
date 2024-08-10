@@ -1,0 +1,21 @@
+# Format information:											
+# Name -  Full name											
+# Shortname - Short name, e.g. appropriate for a graphic											
+# Description -  Description of this signature, cell type & species											
+# Citation - Abbreviated but human readable (e.g. not a DOI URL)											
+NAME	SHORTNAME	DESCRIPTION	CITATION								
+M1 Macrophage Mouse genes	M1 Macrophage	M1 Macrophage Key Differentially expressed transcripts	unknown source	Itgam	Adgre1	C1qa	Cxcl9	Vcam1			
+M2 Macrophage Mouse genes	M2 Macrophage	M2 Macrophage Key Differentially expressed transcripts	unknown source	Itgam	Adgre1	Mrc1	Clec10a	Folr2	Sepp1	Apoe	Maf
+Monocyte Mouse genes	Monocyte	Monocyte Key Differentially expressed transcripts	unknown source	Itgam	Ly6c2	Il1b	Cxcl10	Ms4a4c			
+MDSC Mouse genes	MDSC	MDSC Key Differentially expressed transcripts	unknown source	Itgam	Arg1	Nos2	Pf4	Il1rn			
+Neutrophil Mouse Genes	Neutrophil	Neutrophil Key Differentially expressed transcripts	unknown source	Itgam	Ly6c2	Hp	Msrb1	Ncf2			
+CD11b+ cDC Mouse Genes	CD11b+ cDC	CD11b+ cDC Key Differentially expressed transcripts	unknown source	Itgam	Itgax	Zbtb46	Cd209a	H2-Ab1	H2Eb1		
+MoDC Mouse genes	MoDC	MoDC Key Differentially expressed transcripts	unknown source	Itgam	Clec4b1	Ccl24	Ccr2	H2-Dma	H2-Ab1		
+CD103+ cDC Mouse genes	CD103+ cDC	CD103+ cDC Key Differentially expressed transcripts	unknown source	Flt3	Zbtb46	Clec9a	Xcr1	Cd24a	Cd103	H2-Ab1	
+Migratory cDC Mouse genes	Migratory cDC	Migratory cDC Key Differentially expressed transcripts	unknown source	Flt3	Zbtb46	Batf3	Ccr7	Relb	Ccl22		
+Stromal Cell Mouse genes	Stromal Cell	Stromal Cell Key Differentially expressed transcripts	unknown source	Sparc	Dcn	Igfbp1	Col3a1				
+Plasmacytoid DC Mouse genes	Plasmacytoid DC	Plasmacytoid DC Key Differentially expressed transcripts	unknown source	Ccr9	Siglech	Bst2					
+Mki67+ CD8+ T Cell Mouse genes	Mki67+ CD8+ T Cell	Mki67+ CD8+ T Cell Key Differentially expressed transcripts	unknown source	Cd8a	Cd3g	Tox	Top2a	Cenpe	Cdk4	Thy1	
+Mki67- CD8+ T Cell Mouse genes	Mki67- CD8+ T Cell	Mki67- CD8+ T Cell Key Differentially expressed transcripts	unknown source	Cd8a	Cd3g	Thy1	Tox	Ccl5			
+NK Cell Mouse genes	NK Cell	NK Cell Key Differentially expressed transcripts	unknown source	Ncr1	Klra7	Klre1					
+Treg Mouse genes	Treg	Treg Key Differentially expressed transcripts	unknown source	Cd4	Cd3g	Cd28	Ikzf2	Foxp3			
